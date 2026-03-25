@@ -7,6 +7,7 @@ from logging.handlers import RotatingFileHandler
 def setup_logger(log_path: str) -> logging.Logger:
     logger = logging.getLogger("mexc_futures_bot")
     logger.setLevel(logging.INFO)
+    logger.propagate = False
     logger.handlers.clear()
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")

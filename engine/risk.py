@@ -9,12 +9,16 @@ class RiskPlan:
     entry_price: float
     stop_loss: float
     take_profit: float
+    partial_take_profit_price: float
+    partial_take_profit_pct: float
     trailing_activation_price: float
     trailing_gap_pct: float
     quantity: float
     margin_used: float
     notional: float
     estimated_fee: float
+    initial_stop_distance: float
+    risk_amount: float
 
 
 class RiskManager:
@@ -33,23 +37,25 @@ class RiskManager:
 
         if side == "long":
             stop_loss = entry_price - stop_distance
+            partial_take_profit = entry_price + (stop_distance * self.cfg.partial_take_profit_r)
             take_profit = entry_price + (stop_distance * self.cfg.rr_ratio)
             trailing_activation = entry_price + (stop_distance * self.cfg.trailing_activation_r)
         else:
             stop_loss = entry_price + stop_distance
+            partial_take_profit = entry_price - (stop_distance * self.cfg.partial_take_profit_r)
             take_profit = entry_price - (stop_distance * self.cfg.rr_ratio)
             trailing_activation = entry_price - (stop_distance * self.cfg.trailing_activation_r)
 
-        qty = risk_amount / stop_distance
+        qty = risk_amount / stop_distance if stop_distance > 0 else 0.0
         notional = qty * entry_price
-        margin_used = notional / self.cfg.leverage
+        margin_used = notional / self.cfg.leverage if self.cfg.leverage else notional
         estimated_fee = notional * self.cfg.fee_rate
 
-        if margin_used > wallet_balance * 0.95:
+        if margin_used > wallet_balance * 0.95 and margin_used > 0:
             scale = (wallet_balance * 0.95) / margin_used
             qty *= scale
             notional = qty * entry_price
-            margin_used = notional / self.cfg.leverage
+            margin_used = notional / self.cfg.leverage if self.cfg.leverage else notional
             estimated_fee = notional * self.cfg.fee_rate
 
         return RiskPlan(
@@ -57,10 +63,14 @@ class RiskManager:
             entry_price=entry_price,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            partial_take_profit_price=partial_take_profit,
+            partial_take_profit_pct=min(max(self.cfg.partial_take_profit_pct, 0.0), 0.95),
             trailing_activation_price=trailing_activation,
             trailing_gap_pct=self.cfg.trailing_gap_pct,
             quantity=qty,
             margin_used=margin_used,
             notional=notional,
             estimated_fee=estimated_fee,
+            initial_stop_distance=stop_distance,
+            risk_amount=risk_amount,
         )

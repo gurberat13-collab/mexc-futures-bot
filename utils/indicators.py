@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Tuple
+
 import pandas as pd
 
 
@@ -37,3 +38,29 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         axis=1,
     ).max(axis=1)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+
+    tr = atr(df, period=1)
+    atr_smooth = tr.ewm(alpha=1 / period, adjust=False).mean().replace(0, pd.NA)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_smooth
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_smooth
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)).fillna(0.0)
+    return dx.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def rolling_vwap(df: pd.DataFrame, period: int) -> pd.Series:
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    tpv = typical_price * df["volume"]
+    rolling_tpv = tpv.rolling(period, min_periods=1).sum()
+    rolling_volume = df["volume"].rolling(period, min_periods=1).sum().replace(0, pd.NA)
+    return (rolling_tpv / rolling_volume).fillna(df["close"])

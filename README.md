@@ -1,49 +1,68 @@
 # MEXC Futures Paper Bot
 
-Tam otomatik, paper-trading odaklı MEXC futures bot iskeleti.
+Paper-trading odakli MEXC futures botu. Bu surum artik sadece sinyal ureten basit bir iskelet degil; teshis, healthcheck, backtest, multi-timeframe filtreleri, websocket market akisi ve gelismis pozisyon yonetimi de icerir.
 
-## Bu sürüm ne yapar?
-- MEXC futures public market verisini çeker
-- BTC_USDT ve ETH_USDT tarar
-- agresif trend/breakout sinyali üretir
-- sanal 1000 USDT ile long/short paper işlem açar
-- stop-loss, take-profit ve trailing stop yönetir
-- Telegram üzerinden başlat/durdur/durum/bakiye komutları sunar
-
-## Bu sürüm ne yapmaz?
-- Gerçek emir göndermez
-- MEXC private futures trading API kullanmaz
-- Çoklu pozisyon açmaz
+## Neler var
+- REST + WebSocket market veri akisi
+- BTC/ETH/SOL dahil coklu sembol tarama
+- Multi-timeframe trend onayi
+- Rejim filtresi (trending/ranging)
+- EMA, RSI, MACD, breakout, VWAP, market structure, volatility expansion ve OI proxy tabanli skor
+- Korelasyon limiti
+- Coklu acik pozisyon destegi
+- Partial take profit + break-even + trailing stop
+- Gun sonu raporu
+- Heartbeat / health status
+- Telegram debug ve backtest komutlari
+- Unit test iskeleti
 
 ## Kurulum
 ```bash
 pip install -r requirements.txt
 ```
 
-## Railway Variables
+## Onemli ortam degiskenleri
 ```env
 TELEGRAM_TOKEN=...
 TELEGRAM_CHAT_ID=...
 BOT_ENABLED=true
 SIM_MODE=true
+
+SYMBOLS=BTC_USDT,ETH_USDT,SOL_USDT
+SCAN_INTERVAL_SECONDS=30
+TIMEFRAME=Min15
+HIGHER_TIMEFRAME=Hour4
+
 STARTING_BALANCE=1000
-SYMBOLS=BTC_USDT,ETH_USDT
 LEVERAGE=5
 RISK_PER_TRADE=0.03
-SCAN_INTERVAL_SECONDS=30
+MAX_OPEN_POSITIONS=2
+MAX_TRADES_PER_DAY=12
+COOLDOWN_MINUTES=15
+
+WEBSOCKET_ENABLED=true
+HEARTBEAT_INTERVAL_MINUTES=30
+DAILY_REPORT_ENABLED=true
+BACKTEST_BARS=800
 ```
 
-## Telegram Komutları
-- `/start`
+## Telegram komutlari
 - `/baslat`
 - `/durdur`
 - `/durum`
 - `/bakiye`
 - `/gecmis`
 - `/analiz BTC`
+- `/debug BTC`
+- `/nedenislem BTC`
+- `/health`
+- `/backtest BTC 800`
+- `/gunsonu`
 - `/ayar`
 
 ## Notlar
-- Bu bot paper trading içindir.
-- MEXC futures market data endpointleri resmi futures API dökümantasyonundan alınmıştır.
-- MEXC resmi sayfalarında futures trading API erişiminin kurumsal kullanıcılarla sınırlı olabileceği notu bulunduğu için bu sürüm bilinçli olarak public-data + paper wallet şeklinde tasarlandı.
+- Bot paper trading modunda tasarlandi.
+- `storage/state.json` health ve scan ozetini tutar.
+- `storage/wallet.json` wallet durumunu tutar.
+- `storage/trades.json` kapanan trade eventlerini tutar.
+- Deploy tarafinda `runtime.txt` icindeki Python surumunu kullanman tavsiye edilir.

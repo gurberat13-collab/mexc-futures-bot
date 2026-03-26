@@ -121,6 +121,30 @@ class MexcFuturesClient:
         data = self._get(f"/api/v1/contract/funding_rate/{symbol}")
         return float(data.get("fundingRate", 0.0))
 
+    def get_funding_rate_history(self, symbol: str, page_size: int = 1000, max_pages: int | None = None) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        page_num = 1
+        while True:
+            data = self._get(
+                "/api/v1/contract/funding_rate/history",
+                params={"symbol": symbol, "page_num": page_num, "page_size": page_size},
+            )
+            if not isinstance(data, dict):
+                break
+
+            result_list = data.get("resultList") or []
+            if not isinstance(result_list, list):
+                break
+            records.extend(result_list)
+
+            total_pages = int(data.get("totalPage", page_num) or page_num)
+            if not result_list or page_num >= total_pages:
+                break
+            if max_pages is not None and page_num >= max_pages:
+                break
+            page_num += 1
+        return records
+
     def get_klines(
         self,
         symbol: str,

@@ -64,6 +64,42 @@ class ExchangeTests(unittest.TestCase):
         self.assertEqual(session.calls[0][0], "https://contract.mexc.com/api/v1/contract/ticker")
         self.assertEqual(session.calls[0][1], {"symbol": "BTC_USDT"})
 
+    def test_get_funding_rate_history_collects_pages(self) -> None:
+        client = MexcFuturesClient()
+        session = FakeSession(
+            [
+                FakeResponse(
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "resultList": [{"symbol": "BTC_USDT", "fundingRate": "0.0001", "settleTime": 1}],
+                            "totalPage": 2,
+                        },
+                    },
+                ),
+                FakeResponse(
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "resultList": [{"symbol": "BTC_USDT", "fundingRate": "0.0002", "settleTime": 2}],
+                            "totalPage": 2,
+                        },
+                    },
+                ),
+            ]
+        )
+        client.session = session
+
+        history = client.get_funding_rate_history("BTC_USDT", page_size=500)
+
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["fundingRate"], "0.0001")
+        self.assertEqual(session.calls[0][0], "https://contract.mexc.com/api/v1/contract/funding_rate/history")
+        self.assertEqual(session.calls[0][1], {"symbol": "BTC_USDT", "page_num": 1, "page_size": 500})
+        self.assertEqual(session.calls[1][1], {"symbol": "BTC_USDT", "page_num": 2, "page_size": 500})
+
     @patch("exchange.mexc_futures.time.sleep", return_value=None)
     def test_retry_on_transient_status(self, _sleep) -> None:
         client = MexcFuturesClient()
@@ -98,4 +134,3 @@ class ExchangeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

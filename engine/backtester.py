@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any
+
+import pandas as pd
 
 
 @dataclass
@@ -18,6 +21,7 @@ class BacktestResult:
     profit_factor: float
     expectancy: float
     final_balance: float
+    guardrail_blocks: dict[str, int] = field(default_factory=dict)
 
 
 class Backtester:
@@ -32,54 +36,81 @@ class Backtester:
         bars = bars or self.cfg.backtest_bars
         primary_df = self.client.get_klines(symbol, self.cfg.timeframe, max(bars, self.cfg.backtest_warmup_bars + 50))
         higher_df = self.client.get_klines(symbol, self.cfg.higher_timeframe, self.cfg.higher_kline_limit)
+        funding_timeline = self._load_funding_timeline(symbol)
 
         balance = float(self.cfg.starting_balance)
         peak_equity = balance
         max_drawdown_pct = 0.0
         position: dict[str, Any] | None = None
         completed_trades: list[dict[str, Any]] = []
+        guardrail_blocks: defaultdict[str, int] = defaultdict(int)
+        current_day: str | None = None
+        daily_realized_pnl = 0.0
+        consecutive_losses = 0
+        trades_today = 0
+        last_trade_time: pd.Timestamp | None = None
+        funding_idx = 0
+        current_funding_rate = 0.0
+        pending_entry: dict[str, Any] | None = None
 
         for idx in range(self.cfg.backtest_warmup_bars, len(primary_df)):
             current = primary_df.iloc[idx]
             current_time = current["time"]
+            open_price = float(current["open"])
             close_price = float(current["close"])
             high_price = float(current["high"])
             low_price = float(current["low"])
+            trade_day = current_time.date().isoformat()
+            if current_day != trade_day:
+                current_day = trade_day
+                daily_realized_pnl = 0.0
+                consecutive_losses = 0
+                trades_today = 0
+
+            current_ms = int(current_time.timestamp() * 1000)
+            while funding_idx < len(funding_timeline) and funding_timeline[funding_idx][0] <= current_ms:
+                current_funding_rate = funding_timeline[funding_idx][1]
+                funding_idx += 1
+
+            if pending_entry is not None and position is None:
+                global_block = self._entry_block(
+                    current_time,
+                    last_trade_time,
+                    daily_realized_pnl,
+                    consecutive_losses,
+                    trades_today,
+                )
+                if global_block is not None:
+                    guardrail_blocks[global_block] += 1
+                elif abs(current_funding_rate) > self.cfg.funding_abs_limit:
+                    guardrail_blocks["funding_limit"] += 1
+                else:
+                    position = self._open_backtest_position(open_price, pending_entry["signal"], balance)
+                    balance -= float(position["margin_used"])
+                    trades_today += 1
+                    last_trade_time = current_time
+                pending_entry = None
 
             if position is not None:
                 events, position, balance = self._process_bar(position, high_price, low_price, close_price, balance)
                 completed_trades.extend(events)
+                for event in events:
+                    daily_realized_pnl += float(event["net_pnl"])
+                    if event["trade_type"] == "full_close":
+                        consecutive_losses = consecutive_losses + 1 if float(event["position_net_pnl"]) < 0 else 0
 
-            if position is None:
+            if position is None and idx + 1 < len(primary_df):
                 primary_slice = primary_df.iloc[: idx + 1]
                 higher_slice = higher_df[higher_df["time"] <= current_time].tail(self.cfg.higher_kline_limit)
-                signal = self.strategy.analyze(symbol, primary_slice, higher_df=higher_slice, market_context={"oi_supported": False, "hold_vol_ratio": 0.0})
+                signal = self.strategy.analyze(
+                    symbol,
+                    primary_slice,
+                    higher_df=higher_slice,
+                    market_context={"oi_supported": False, "hold_vol_ratio": 0.0},
+                )
                 last_candle_pct = abs((primary_slice.iloc[-1]["close"] - primary_slice.iloc[-1]["open"]) / primary_slice.iloc[-1]["open"])
                 if signal.action != "hold" and signal.regime_ok and last_candle_pct <= self.cfg.max_last_candle_pct:
-                    plan = self.risk.build_plan(symbol, signal.action, close_price, signal.atr_value, balance)
-                    position = {
-                        "symbol": symbol,
-                        "side": signal.action,
-                        "entry_price": close_price,
-                        "quantity": plan.quantity,
-                        "initial_quantity": plan.quantity,
-                        "margin_used": plan.margin_used,
-                        "fees_paid": plan.estimated_fee,
-                        "stop_loss": plan.stop_loss,
-                        "take_profit": plan.take_profit,
-                        "partial_take_profit_price": plan.partial_take_profit_price,
-                        "partial_take_profit_pct": plan.partial_take_profit_pct,
-                        "partial_take_profit_taken": False,
-                        "break_even_armed": False,
-                        "trailing_active": False,
-                        "trailing_activation_price": plan.trailing_activation_price,
-                        "trailing_gap_pct": plan.trailing_gap_pct,
-                        "trailing_stop": None,
-                        "highest_price": close_price,
-                        "lowest_price": close_price,
-                        "realized_partial_pnl": 0.0,
-                    }
-                    balance -= plan.margin_used
+                    pending_entry = {"signal": signal}
 
             equity = balance
             if position is not None:
@@ -127,8 +158,79 @@ class Backtester:
             profit_factor=round(profit_factor, 2),
             expectancy=round(expectancy, 4),
             final_balance=round(final_balance, 2),
+            guardrail_blocks=dict(guardrail_blocks),
         )
         return result, completed_trades
+
+    def _open_backtest_position(self, entry_price: float, signal: Any, balance: float) -> dict[str, Any]:
+        plan = self.risk.build_plan("BACKTEST", signal.action, entry_price, signal.atr_value, balance)
+        effective_entry = (
+            entry_price + (entry_price * self.cfg.slippage_rate)
+            if signal.action == "long"
+            else entry_price - (entry_price * self.cfg.slippage_rate)
+        )
+        return {
+            "symbol": getattr(signal, "symbol", "BACKTEST"),
+            "side": signal.action,
+            "entry_price": effective_entry,
+            "quantity": plan.quantity,
+            "initial_quantity": plan.quantity,
+            "margin_used": plan.margin_used,
+            "fees_paid": plan.estimated_fee,
+            "stop_loss": plan.stop_loss,
+            "take_profit": plan.take_profit,
+            "partial_take_profit_price": plan.partial_take_profit_price,
+            "partial_take_profit_pct": plan.partial_take_profit_pct,
+            "partial_take_profit_taken": False,
+            "break_even_armed": False,
+            "trailing_active": False,
+            "trailing_activation_price": plan.trailing_activation_price,
+            "trailing_gap_pct": plan.trailing_gap_pct,
+            "trailing_stop": None,
+            "highest_price": effective_entry,
+            "lowest_price": effective_entry,
+            "realized_partial_pnl": 0.0,
+        }
+
+    def _entry_block(
+        self,
+        current_time: pd.Timestamp,
+        last_trade_time: pd.Timestamp | None,
+        daily_realized_pnl: float,
+        consecutive_losses: int,
+        trades_today: int,
+    ) -> str | None:
+        if last_trade_time is not None and current_time < last_trade_time + pd.Timedelta(minutes=self.cfg.cooldown_minutes):
+            return "cooldown"
+        if daily_realized_pnl <= -(self.cfg.starting_balance * self.cfg.daily_loss_limit_pct):
+            return "daily_loss_limit"
+        if consecutive_losses >= self.cfg.max_consecutive_losses:
+            return "consecutive_loss_limit"
+        if trades_today >= self.cfg.max_trades_per_day:
+            return "position_or_trade_limit"
+        return None
+
+    def _load_funding_timeline(self, symbol: str) -> list[tuple[int, float]]:
+        if self.cfg.funding_abs_limit <= 0:
+            return []
+        if not hasattr(self.client, "get_funding_rate_history"):
+            return []
+        try:
+            raw_history = self.client.get_funding_rate_history(symbol, page_size=1000)
+        except Exception as exc:
+            self.logger.warning("Funding history unavailable for %s: %s", symbol, exc)
+            return []
+
+        timeline: list[tuple[int, float]] = []
+        for item in raw_history:
+            try:
+                settle_time = int(item.get("settleTime", 0) or 0)
+                funding_rate = float(item.get("fundingRate", 0.0) or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            timeline.append((settle_time, funding_rate))
+        timeline.sort(key=lambda row: row[0])
+        return timeline
 
     def _process_bar(self, position: dict[str, Any], high_price: float, low_price: float, close_price: float, balance: float):
         side = position["side"]
@@ -210,8 +312,10 @@ class Backtester:
         side = position["side"]
         margin_release = float(position["margin_used"]) * fraction
         open_fee_alloc = float(position["fees_paid"]) * fraction
-        close_fee = abs(exit_price * qty_closed) * self.cfg.fee_rate
-        gross = (exit_price - entry) * qty_closed if side == "long" else (entry - exit_price) * qty_closed
+        exit_slippage = exit_price * self.cfg.slippage_rate
+        effective_exit = exit_price - exit_slippage if side == "long" else exit_price + exit_slippage
+        close_fee = abs(effective_exit * qty_closed) * self.cfg.fee_rate
+        gross = (effective_exit - entry) * qty_closed if side == "long" else (entry - effective_exit) * qty_closed
         net = gross - close_fee - open_fee_alloc
 
         balance += margin_release + net

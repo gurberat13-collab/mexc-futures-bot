@@ -87,6 +87,9 @@ class ScannerEngine:
             events = self.position_manager.update_positions(position_snapshots, intrabar_by_symbol=intrabar_ranges)
             for event in events:
                 await self._handle_position_event(event)
+            if self.risk.daily_loss_breached(self.wallet) and self.wallet.open_positions:
+                for event in self._flatten_positions(position_snapshots, "daily_loss_kill_switch"):
+                    await self._handle_position_event(event)
         else:
             self.wallet.set_equity(self.wallet.balance)
 
@@ -252,8 +255,8 @@ class ScannerEngine:
         }
 
     async def _analyze_symbol(self, symbol: str) -> dict[str, Any]:
-        primary_df = self.client.get_klines(symbol, self.cfg.timeframe, self.cfg.kline_limit)
-        higher_df = self.client.get_klines(symbol, self.cfg.higher_timeframe, self.cfg.higher_kline_limit)
+        primary_df = self._closed_signal_frame(self.client.get_klines(symbol, self.cfg.timeframe, self.cfg.kline_limit))
+        higher_df = self._closed_signal_frame(self.client.get_klines(symbol, self.cfg.higher_timeframe, self.cfg.higher_kline_limit))
         snapshot = await self._get_snapshot(symbol)
 
         last_candle_pct = abs((primary_df.iloc[-1]["close"] - primary_df.iloc[-1]["open"]) / primary_df.iloc[-1]["open"])
@@ -337,6 +340,11 @@ class ScannerEngine:
             "higher_df": higher_df,
             "plan": plan,
         }
+
+    def _closed_signal_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if len(frame) <= 1:
+            raise RuntimeError("Insufficient closed candles for signal analysis")
+        return frame.iloc[:-1].reset_index(drop=True)
 
     async def _get_snapshot(self, symbol: str):
         snapshot = self.market_stream.get_snapshot(symbol) if self.market_stream else None
@@ -509,6 +517,22 @@ class ScannerEngine:
             )
         self.logger.info(msg.replace("\n", " | "))
         await self.notifier(msg)
+
+    def _flatten_positions(self, snapshots_by_symbol: dict[str, Any], exit_reason: str) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for pos in list(self.wallet.open_positions):
+            snapshot = snapshots_by_symbol.get(pos["symbol"])
+            if snapshot is None:
+                continue
+            trade = self.wallet.close_trade(
+                pos["id"],
+                float(snapshot.last_price),
+                exit_reason,
+                self.cfg.fee_rate,
+                self.cfg.slippage_rate,
+            )
+            events.append({"kind": "full_exit", "trade": trade})
+        return events
 
     async def _maybe_send_heartbeat(self) -> None:
         if self.cfg.heartbeat_interval_minutes <= 0:

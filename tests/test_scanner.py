@@ -96,6 +96,41 @@ class AlwaysLongStrategy:
         )
 
 
+class SpyStrategy:
+    def __init__(self):
+        self.primary_last_close = None
+        self.higher_last_close = None
+
+    def analyze(self, _symbol: str, df: pd.DataFrame, snapshot=None, higher_df: pd.DataFrame | None = None, market_context=None):
+        self.primary_last_close = float(df.iloc[-1]["close"])
+        self.higher_last_close = float(higher_df.iloc[-1]["close"]) if higher_df is not None and not higher_df.empty else None
+        return SimpleNamespace(
+            symbol=_symbol,
+            action="hold",
+            score=0,
+            bullish_votes=0,
+            bearish_votes=0,
+            directional_votes=0,
+            opposing_votes=0,
+            signal_conflict_ratio=0.0,
+            reason="spy",
+            hold_vol_ratio=1.0,
+            regime="trending",
+            adx_value=30.0,
+            atr_pct=0.01,
+            higher_timeframe_bias="neutral",
+            higher_timeframe_confirmed=True,
+            volume_ratio=1.0,
+            market_structure="neutral",
+            vwap_distance_pct=0.0,
+            volatility_expansion=False,
+            breakout_up=False,
+            breakout_down=False,
+            blocked_by=[],
+            atr_value=0.01,
+        )
+
+
 class FakeClient:
     def __init__(self):
         self.frame = pd.DataFrame(
@@ -108,6 +143,15 @@ class FakeClient:
                     "low": 99.9,
                     "volume": 1000,
                     "amount": 100100,
+                },
+                {
+                    "time": pd.Timestamp("2026-04-09 00:15:00", tz="UTC"),
+                    "open": 100.1,
+                    "close": 100.2,
+                    "high": 100.3,
+                    "low": 100.0,
+                    "volume": 1001,
+                    "amount": 100300.2,
                 }
             ]
         )
@@ -163,6 +207,119 @@ class ScannerTests(unittest.TestCase):
             self.assertGreaterEqual(wallet.balance, 0.0)
             self.assertAlmostEqual(float(positions[0]["margin_used"]), 950.0)
             self.assertAlmostEqual(float(positions[1]["margin_used"]), 47.5)
+
+    def test_daily_loss_limit_kill_switch_closes_remaining_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = DummyConfig()
+            cfg.state_path = f"{tmp}/state.json"
+            cfg.daily_loss_limit_pct = 0.01
+            wallet = PaperWallet(f"{tmp}/wallet.json", f"{tmp}/trades.json", 1000)
+            wallet.open_trade(
+                Position(
+                    id="p1",
+                    symbol="BTC_USDT",
+                    side="long",
+                    entry_price=100.0,
+                    initial_quantity=1.0,
+                    quantity=1.0,
+                    leverage=5,
+                    stop_loss=90.0,
+                    take_profit=120.0,
+                    partial_take_profit_price=110.0,
+                    partial_take_profit_pct=0.5,
+                    partial_take_profit_taken=False,
+                    break_even_armed=False,
+                    trailing_active=False,
+                    trailing_activation_price=115.0,
+                    trailing_gap_pct=0.01,
+                    trailing_stop=None,
+                    opened_at="2026-01-01T00:00:00+00:00",
+                    highest_price=100.0,
+                    lowest_price=100.0,
+                    fees_paid=0.0,
+                    realized_partial_pnl=0.0,
+                    margin_used=20.0,
+                    reason="test",
+                    score=5,
+                    regime="trending",
+                    higher_timeframe_bias="bullish",
+                )
+            )
+            wallet.data["daily_realized_pnl"] = -11.0
+            wallet.save()
+
+            scanner = ScannerEngine(
+                cfg,
+                FakeClient(),
+                AlwaysLongStrategy(),
+                RiskManager(cfg),
+                wallet,
+                Executor(cfg, wallet),
+                PositionManager(cfg, wallet),
+                DummyLogger(),
+                noop_notifier,
+            )
+
+            asyncio.run(scanner.start())
+            asyncio.run(scanner.tick())
+
+            self.assertFalse(wallet.open_positions)
+            self.assertEqual(wallet.data["history"][0]["exit_reason"], "daily_loss_kill_switch")
+
+    def test_scanner_uses_only_closed_candles_for_signal_analysis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = DummyConfig()
+            cfg.state_path = f"{tmp}/state.json"
+            wallet = PaperWallet(f"{tmp}/wallet.json", f"{tmp}/trades.json", 1000)
+            client = FakeClient()
+            client.frame = pd.DataFrame(
+                [
+                    {
+                        "time": pd.Timestamp("2026-04-09 00:00:00", tz="UTC"),
+                        "open": 100.0,
+                        "close": 101.0,
+                        "high": 101.2,
+                        "low": 99.8,
+                        "volume": 1000,
+                        "amount": 101000,
+                    },
+                    {
+                        "time": pd.Timestamp("2026-04-09 00:15:00", tz="UTC"),
+                        "open": 101.0,
+                        "close": 102.0,
+                        "high": 102.2,
+                        "low": 100.8,
+                        "volume": 1001,
+                        "amount": 102102,
+                    },
+                    {
+                        "time": pd.Timestamp("2026-04-09 00:30:00", tz="UTC"),
+                        "open": 102.0,
+                        "close": 999.0,
+                        "high": 999.5,
+                        "low": 101.5,
+                        "volume": 1002,
+                        "amount": 1000998,
+                    },
+                ]
+            )
+            strategy = SpyStrategy()
+            scanner = ScannerEngine(
+                cfg,
+                client,
+                strategy,
+                RiskManager(cfg),
+                wallet,
+                Executor(cfg, wallet),
+                PositionManager(cfg, wallet),
+                DummyLogger(),
+                noop_notifier,
+            )
+
+            asyncio.run(scanner._analyze_symbol("BTC_USDT"))
+
+            self.assertEqual(strategy.primary_last_close, 102.0)
+            self.assertEqual(strategy.higher_last_close, 102.0)
 
     def test_wallet_rejects_position_when_margin_exceeds_balance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -42,12 +42,40 @@ COOLDOWN_MINUTES=60
 RR_RATIO=2.2
 REGIME_ADX_THRESHOLD=25
 PARTIAL_TAKE_PROFIT_R=1.5
+MIN_EXPECTED_NET_RR=1.10
+MIN_EXPECTED_NET_PROFIT_PCT=0.0008
+MIN_DIRECTIONAL_VOTES=4
+MAX_CONFLICT_RATIO=0.42
+POSITION_INTRABAR_FROM_KLINES=true
 
 WEBSOCKET_ENABLED=true
 HEARTBEAT_INTERVAL_MINUTES=30
 DAILY_REPORT_ENABLED=true
 BACKTEST_BARS=800
 ```
+
+## Hazir profil presetleri
+
+Botta artik `TRADING_PROFILE` ile uc farkli varsayilan profil secilebilir:
+
+- `conservative`: daha az islem, daha dusuk risk
+- `balanced`: orta risk, orta frekans
+- `aggressive_safe`: daha fazla firsat, guvenlik filtreleri aktif
+
+Kullanim:
+
+```env
+TRADING_PROFILE=conservative
+```
+
+Not:
+- `TRADING_PROFILE` sadece varsayilan degerleri ayarlar.
+- `.env` icinde tek tek verdigin degerler her zaman profil varsayilanlarini ezer.
+
+Hazir ornek dosyalar:
+- `.env.conservative.example`
+- `.env.balanced.example`
+- `.env.aggressive_safe.example`
 
 ## Telegram komutlari
 - `/baslat`

@@ -85,10 +85,16 @@ class Backtester:
                 elif abs(current_funding_rate) > self.cfg.funding_abs_limit:
                     guardrail_blocks["funding_limit"] += 1
                 else:
-                    position = self._open_backtest_position(open_price, pending_entry["signal"], balance)
-                    balance -= float(position["margin_used"])
-                    trades_today += 1
-                    last_trade_time = current_time
+                    signal = pending_entry["signal"]
+                    plan = self.risk.build_plan("BACKTEST", signal.action, open_price, signal.atr_value, balance)
+                    edge = self._estimate_entry_edge(signal.action, open_price, plan, balance)
+                    if edge.get("blocked_reason"):
+                        guardrail_blocks[str(edge["blocked_reason"])] += 1
+                    else:
+                        position = self._open_backtest_position(open_price, signal, balance, plan=plan)
+                        balance -= float(position["margin_used"])
+                        trades_today += 1
+                        last_trade_time = current_time
                 pending_entry = None
 
             if position is not None:
@@ -162,8 +168,9 @@ class Backtester:
         )
         return result, completed_trades
 
-    def _open_backtest_position(self, entry_price: float, signal: Any, balance: float) -> dict[str, Any]:
-        plan = self.risk.build_plan("BACKTEST", signal.action, entry_price, signal.atr_value, balance)
+    def _open_backtest_position(self, entry_price: float, signal: Any, balance: float, plan=None) -> dict[str, Any]:
+        if plan is None:
+            plan = self.risk.build_plan("BACKTEST", signal.action, entry_price, signal.atr_value, balance)
         effective_entry = (
             entry_price + (entry_price * self.cfg.slippage_rate)
             if signal.action == "long"
@@ -190,6 +197,41 @@ class Backtester:
             "highest_price": effective_entry,
             "lowest_price": effective_entry,
             "realized_partial_pnl": 0.0,
+        }
+
+    def _estimate_entry_edge(self, side: str, entry_price: float, plan: Any, balance: float) -> dict[str, Any]:
+        qty = float(getattr(plan, "quantity", 0.0) or 0.0)
+        if qty <= 0:
+            return {"blocked_reason": "cost_edge_limit"}
+
+        slippage = float(self.cfg.slippage_rate)
+        fee_rate = float(self.cfg.fee_rate)
+        tp = float(plan.take_profit)
+        sl = float(plan.stop_loss)
+        tp_exit = tp - (tp * slippage) if side == "long" else tp + (tp * slippage)
+        sl_exit = sl - (sl * slippage) if side == "long" else sl + (sl * slippage)
+
+        gross_tp = (tp_exit - entry_price) * qty if side == "long" else (entry_price - tp_exit) * qty
+        gross_sl = (sl_exit - entry_price) * qty if side == "long" else (entry_price - sl_exit) * qty
+
+        open_fee = abs(entry_price * qty) * fee_rate
+        close_fee_tp = abs(tp_exit * qty) * fee_rate
+        close_fee_sl = abs(sl_exit * qty) * fee_rate
+        net_tp = gross_tp - open_fee - close_fee_tp
+        net_sl = gross_sl - open_fee - close_fee_sl
+        net_rr = net_tp / abs(net_sl) if net_sl < 0 else (999.0 if net_tp > 0 else 0.0)
+
+        min_rr = float(getattr(self.cfg, "min_expected_net_rr", 0.0))
+        min_profit_pct = float(getattr(self.cfg, "min_expected_net_profit_pct", 0.0))
+        min_profit_abs = max(float(balance) * min_profit_pct, 0.0)
+        blocked_reason = None
+        if net_tp <= 0 or net_rr < min_rr or net_tp < min_profit_abs:
+            blocked_reason = "cost_edge_limit"
+        return {
+            "expected_net_tp": net_tp,
+            "expected_net_sl": net_sl,
+            "expected_net_rr": net_rr,
+            "blocked_reason": blocked_reason,
         }
 
     def _entry_block(

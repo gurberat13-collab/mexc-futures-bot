@@ -76,14 +76,22 @@ class TelegramController:
     async def bakiye_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         self.wallet.rollover_if_needed()
         stats = self.wallet.data.get("daily_stats", {})
+        start = float(self.cfg.starting_balance)
+        realized = float(self.wallet.data.get("realized_pnl", 0.0))
+        bal = float(self.wallet.data["balance"])
+        # No open margin in balance: bakiye ≈ başlangıç + kümülatif realized PnL
+        total_return_pct = ((bal - start) / start * 100.0) if start > 0 else 0.0
         text = (
             "Paper Wallet\n"
-            f"Bakiye: {self.wallet.data['balance']:.2f} USDT\n"
+            f"Baslangic: {start:.2f} USDT\n"
+            f"Bakiye: {bal:.2f} USDT\n"
             f"Equity: {self.wallet.data['equity']:.2f} USDT\n"
-            f"Toplam PnL: {self.wallet.data['realized_pnl']:.2f} USDT\n"
-            f"Gunluk PnL: {self.wallet.data['daily_realized_pnl']:.2f} USDT\n"
+            f"Toplam realized PnL (tum zamanlar): {realized:.2f} USDT\n"
+            f"Toplam getiri: {total_return_pct:+.2f}%\n"
+            f"---\n"
+            f"Gunluk realized PnL: {self.wallet.data['daily_realized_pnl']:.2f} USDT\n"
             f"Bugun kapanan islem: {stats.get('closed_trades', 0)}\n"
-            f"Win/Loss: {stats.get('wins', 0)}/{stats.get('losses', 0)}"
+            f"Win/Loss (bugun): {stats.get('wins', 0)}/{stats.get('losses', 0)}"
         )
         await update.message.reply_text(text)
 
@@ -144,6 +152,8 @@ class TelegramController:
             f"Last candle pct: {debug.get('last_candle_pct', 0.0):.4f}\n"
             f"Volume ratio: {debug.get('volume_ratio', 0.0):.2f}\n"
             f"OI ratio: {debug.get('hold_vol_ratio', 0.0):.3f}\n"
+            f"Votes (dir/opp): {debug.get('directional_votes', 0)}/{debug.get('opposing_votes', 0)}\n"
+            f"Net RR estimate: {debug.get('expected_net_rr', 0.0):.2f}\n"
             f"Reason: {debug.get('reason', 'n/a')}"
         )
         await update.message.reply_text(text)
@@ -205,9 +215,14 @@ class TelegramController:
     async def ayar_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = (
             "Ayarlar\n"
+            f"Profil: {self.cfg.trading_profile}\n"
             f"Kaldirac: {self.cfg.leverage}x\n"
             f"Risk/islem: %{self.cfg.risk_per_trade * 100:.1f}\n"
             f"Gunluk zarar limiti: %{self.cfg.daily_loss_limit_pct * 100:.1f}\n"
+            f"Min net RR: {self.cfg.min_expected_net_rr:.2f}\n"
+            f"Min net kar/denge: %{self.cfg.min_expected_net_profit_pct * 100:.2f}\n"
+            f"Min yonlu oy: {self.cfg.min_directional_votes}\n"
+            f"Max catisma: {self.cfg.max_conflict_ratio:.2f}\n"
             f"Tarama araligi: {self.cfg.scan_interval_seconds}s\n"
             f"Timeframe: {self.cfg.timeframe} / {self.cfg.higher_timeframe}\n"
             f"Max acik pozisyon: {self.cfg.max_open_positions}\n"

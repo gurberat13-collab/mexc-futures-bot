@@ -36,6 +36,11 @@ class Signal:
     higher_timeframe_score: int
     hold_vol_ratio: float
     oi_supported: bool
+    bullish_votes: int
+    bearish_votes: int
+    directional_votes: int
+    opposing_votes: int
+    signal_conflict_ratio: float
     blocked_by: list[str] = field(default_factory=list)
 
 
@@ -67,75 +72,73 @@ class StrategyEngine:
         lookback = d.iloc[-(self.cfg.breakout_lookback + 1):-1]
 
         score = 0
+        bullish_votes = 0
+        bearish_votes = 0
         reasons: list[str] = []
         blocked_by: list[str] = []
 
-        if latest["ema_fast"] > latest["ema_slow"]:
+        def add_bull(reason: str) -> None:
+            nonlocal score, bullish_votes
             score += 1
-            reasons.append("EMA bullish")
-        elif latest["ema_fast"] < latest["ema_slow"]:
+            bullish_votes += 1
+            reasons.append(reason)
+
+        def add_bear(reason: str) -> None:
+            nonlocal score, bearish_votes
             score -= 1
-            reasons.append("EMA bearish")
+            bearish_votes += 1
+            reasons.append(reason)
+
+        if latest["ema_fast"] > latest["ema_slow"]:
+            add_bull("EMA bullish")
+        elif latest["ema_fast"] < latest["ema_slow"]:
+            add_bear("EMA bearish")
 
         if latest["rsi"] > 55:
-            score += 1
-            reasons.append("RSI strong")
+            add_bull("RSI strong")
         elif latest["rsi"] < 45:
-            score -= 1
-            reasons.append("RSI weak")
+            add_bear("RSI weak")
 
         if latest["macd_hist"] > 0:
-            score += 1
-            reasons.append("MACD positive")
+            add_bull("MACD positive")
         elif latest["macd_hist"] < 0:
-            score -= 1
-            reasons.append("MACD negative")
+            add_bear("MACD negative")
 
         volume_ratio = float(latest["volume"] / latest["vol_sma"]) if pd.notna(latest["vol_sma"]) and latest["vol_sma"] else 1.0
         if volume_ratio >= self.cfg.volume_spike_threshold:
             if latest["close"] >= latest["open"]:
-                score += 1
-                reasons.append("Bullish volume spike")
+                add_bull("Bullish volume spike")
             else:
-                score -= 1
-                reasons.append("Bearish volume spike")
+                add_bear("Bearish volume spike")
 
         breakout_up = float(latest["close"]) > float(lookback["high"].max()) if not lookback.empty else False
         breakout_down = float(latest["close"]) < float(lookback["low"].min()) if not lookback.empty else False
         if breakout_up:
-            score += 1
-            reasons.append("Breakout up")
+            add_bull("Breakout up")
         if breakout_down:
-            score -= 1
-            reasons.append("Breakout down")
+            add_bear("Breakout down")
 
         vwap_value = float(latest["vwap"])
         vwap_distance_pct = float((latest["close"] - latest["vwap"]) / latest["vwap"]) if latest["vwap"] else 0.0
         if vwap_distance_pct > 0:
-            score += 1
-            reasons.append("Above VWAP")
+            add_bull("Above VWAP")
         elif vwap_distance_pct < 0:
-            score -= 1
-            reasons.append("Below VWAP")
+            add_bear("Below VWAP")
 
         market_structure = self._market_structure(d, self.cfg.market_structure_lookback)
         if market_structure == "bullish":
-            score += 1
-            reasons.append("Bullish structure")
+            add_bull("Bullish structure")
         elif market_structure == "bearish":
-            score -= 1
-            reasons.append("Bearish structure")
+            add_bear("Bearish structure")
 
         volatility_expansion = bool(
             pd.notna(latest["atr_sma"]) and latest["atr"] >= (latest["atr_sma"] * self.cfg.volatility_expansion_ratio)
         )
         if volatility_expansion:
             if latest["close"] >= latest["open"]:
-                score += 1
-                reasons.append("Volatility expansion up")
+                add_bull("Volatility expansion up")
             else:
-                score -= 1
-                reasons.append("Volatility expansion down")
+                add_bear("Volatility expansion down")
 
         hold_vol_ratio = 0.0
         oi_supported = False
@@ -144,11 +147,9 @@ class StrategyEngine:
             oi_supported = bool(market_context.get("oi_supported", False))
         if oi_supported and hold_vol_ratio >= self.cfg.open_interest_increase_ratio:
             if latest["close"] >= latest["open"]:
-                score += 1
-                reasons.append("Open interest rising with price")
+                add_bull("Open interest rising with price")
             else:
-                score -= 1
-                reasons.append("Open interest rising with sell pressure")
+                add_bear("Open interest rising with sell pressure")
 
         regime = "trending" if float(latest["adx"]) >= self.cfg.regime_adx_threshold and float(latest["atr_pct"]) >= self.cfg.regime_atr_pct_threshold else "ranging"
         regime_ok = (not self.cfg.require_trending_regime) or regime == "trending"
@@ -162,16 +163,41 @@ class StrategyEngine:
             higher_timeframe_score = self._higher_timeframe_score(higher_df)
             higher_timeframe_bias = "bullish" if higher_timeframe_score > 0 else "bearish" if higher_timeframe_score < 0 else "neutral"
             if higher_timeframe_bias == "bullish":
-                reasons.append("Higher timeframe bullish")
+                add_bull("Higher timeframe bullish")
             elif higher_timeframe_bias == "bearish":
-                reasons.append("Higher timeframe bearish")
-            score += 1 if higher_timeframe_bias == "bullish" else -1 if higher_timeframe_bias == "bearish" else 0
+                add_bear("Higher timeframe bearish")
 
         action = "hold"
         if score >= self.cfg.aggressive_score_threshold:
             action = "long"
         elif score <= -self.cfg.aggressive_score_threshold:
             action = "short"
+
+        directional_votes = 0
+        opposing_votes = 0
+        signal_conflict_ratio = 0.0
+        if action != "hold":
+            if action == "long":
+                directional_votes = bullish_votes
+                opposing_votes = bearish_votes
+            else:
+                directional_votes = bearish_votes
+                opposing_votes = bullish_votes
+
+            total_votes = directional_votes + opposing_votes
+            signal_conflict_ratio = (opposing_votes / total_votes) if total_votes else 0.0
+
+            min_directional_votes = int(getattr(self.cfg, "min_directional_votes", 0))
+            max_conflict_ratio = float(getattr(self.cfg, "max_conflict_ratio", 1.0))
+            if directional_votes < min_directional_votes:
+                blocked_by.append("weak_directional_votes")
+                action = "hold"
+            if signal_conflict_ratio > max_conflict_ratio:
+                blocked_by.append("signal_conflict")
+                action = "hold"
+        else:
+            total_votes = bullish_votes + bearish_votes
+            signal_conflict_ratio = (min(bullish_votes, bearish_votes) / total_votes) if total_votes else 0.0
 
         if action == "long" and higher_df is not None:
             higher_timeframe_confirmed = higher_timeframe_bias == "bullish"
@@ -216,6 +242,11 @@ class StrategyEngine:
             higher_timeframe_score=higher_timeframe_score,
             hold_vol_ratio=hold_vol_ratio,
             oi_supported=oi_supported,
+            bullish_votes=bullish_votes,
+            bearish_votes=bearish_votes,
+            directional_votes=directional_votes,
+            opposing_votes=opposing_votes,
+            signal_conflict_ratio=signal_conflict_ratio,
             blocked_by=blocked_by,
         )
 

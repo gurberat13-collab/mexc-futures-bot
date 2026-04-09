@@ -28,9 +28,15 @@ class PositionManager:
         self.wallet.set_equity(equity)
         return equity
 
-    def update_positions(self, snapshots_by_symbol: dict[str, Any]) -> list[dict]:
+    def update_positions(
+        self,
+        snapshots_by_symbol: dict[str, Any],
+        intrabar_by_symbol: dict[str, dict[str, float]] | None = None,
+    ) -> list[dict]:
         events: list[dict] = []
-        for original in self.wallet.open_positions:
+        intrabar_by_symbol = intrabar_by_symbol or {}
+        # Snapshot: full close removes items from open_positions; mutating while iterating skips symbols.
+        for original in list(self.wallet.open_positions):
             position_id = original["id"]
             snapshot = snapshots_by_symbol.get(original["symbol"])
             if snapshot is None:
@@ -38,15 +44,21 @@ class PositionManager:
 
             pos = dict(original)
             last_price = float(snapshot.last_price)
+            bar = intrabar_by_symbol.get(original["symbol"], {})
+            bar_high = float(bar.get("high", last_price))
+            bar_low = float(bar.get("low", last_price))
+            bar_close = float(bar.get("close", last_price))
+            high_price = max(last_price, bar_high)
+            low_price = min(last_price, bar_low)
             side = pos["side"]
-            pos["highest_price"] = max(float(pos["highest_price"]), last_price)
-            pos["lowest_price"] = min(float(pos["lowest_price"]), last_price)
+            pos["highest_price"] = max(float(pos["highest_price"]), high_price)
+            pos["lowest_price"] = min(float(pos["lowest_price"]), low_price)
 
             if not pos.get("partial_take_profit_taken", False):
                 partial_hit = (
-                    side == "long" and last_price >= float(pos["partial_take_profit_price"])
+                    side == "long" and high_price >= float(pos["partial_take_profit_price"])
                 ) or (
-                    side == "short" and last_price <= float(pos["partial_take_profit_price"])
+                    side == "short" and low_price <= float(pos["partial_take_profit_price"])
                 )
                 if partial_hit:
                     trade = self.wallet.reduce_trade(
@@ -70,12 +82,12 @@ class PositionManager:
                             pos["stop_loss"] = min(float(pos["stop_loss"]), float(pos["entry_price"]))
 
             if not pos.get("trailing_active", False):
-                if side == "long" and last_price >= float(pos["trailing_activation_price"]):
+                if side == "long" and high_price >= float(pos["trailing_activation_price"]):
                     pos["trailing_active"] = True
-                    pos["trailing_stop"] = last_price * (1 - float(pos["trailing_gap_pct"]))
-                elif side == "short" and last_price <= float(pos["trailing_activation_price"]):
+                    pos["trailing_stop"] = high_price * (1 - float(pos["trailing_gap_pct"]))
+                elif side == "short" and low_price <= float(pos["trailing_activation_price"]):
                     pos["trailing_active"] = True
-                    pos["trailing_stop"] = last_price * (1 + float(pos["trailing_gap_pct"]))
+                    pos["trailing_stop"] = low_price * (1 + float(pos["trailing_gap_pct"]))
             else:
                 if side == "long":
                     new_stop = float(pos["highest_price"]) * (1 - float(pos["trailing_gap_pct"]))
@@ -87,25 +99,32 @@ class PositionManager:
             self.wallet.update_open_position(position_id, pos)
 
             exit_reason = None
+            exit_price = bar_close
             if side == "long":
-                if last_price <= float(pos["stop_loss"]):
+                if low_price <= float(pos["stop_loss"]):
                     exit_reason = "stop_loss"
-                elif last_price >= float(pos["take_profit"]):
+                    exit_price = float(pos["stop_loss"])
+                elif high_price >= float(pos["take_profit"]):
                     exit_reason = "take_profit"
-                elif pos.get("trailing_active") and last_price <= float(pos["trailing_stop"]):
+                    exit_price = float(pos["take_profit"])
+                elif pos.get("trailing_active") and low_price <= float(pos["trailing_stop"]):
                     exit_reason = "trailing_stop"
+                    exit_price = float(pos["trailing_stop"])
             else:
-                if last_price >= float(pos["stop_loss"]):
+                if high_price >= float(pos["stop_loss"]):
                     exit_reason = "stop_loss"
-                elif last_price <= float(pos["take_profit"]):
+                    exit_price = float(pos["stop_loss"])
+                elif low_price <= float(pos["take_profit"]):
                     exit_reason = "take_profit"
-                elif pos.get("trailing_active") and last_price >= float(pos["trailing_stop"]):
+                    exit_price = float(pos["take_profit"])
+                elif pos.get("trailing_active") and high_price >= float(pos["trailing_stop"]):
                     exit_reason = "trailing_stop"
+                    exit_price = float(pos["trailing_stop"])
 
             if exit_reason:
                 trade = self.wallet.close_trade(
                     position_id,
-                    last_price,
+                    exit_price,
                     exit_reason,
                     self.cfg.fee_rate,
                     self.cfg.slippage_rate,

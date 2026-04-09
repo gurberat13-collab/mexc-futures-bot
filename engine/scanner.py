@@ -82,8 +82,9 @@ class ScannerEngine:
         open_symbols = sorted({pos["symbol"] for pos in self.wallet.open_positions})
         position_snapshots = await self._get_snapshots(open_symbols)
         if position_snapshots:
+            intrabar_ranges = self._get_latest_bar_ranges(open_symbols)
             self.position_manager.mark_equity({symbol: snap.last_price for symbol, snap in position_snapshots.items()})
-            events = self.position_manager.update_positions(position_snapshots)
+            events = self.position_manager.update_positions(position_snapshots, intrabar_by_symbol=intrabar_ranges)
             for event in events:
                 await self._handle_position_event(event)
         else:
@@ -268,6 +269,11 @@ class ScannerEngine:
             "blocks": blocks,
             "action": signal.action,
             "score": signal.score,
+            "bullish_votes": signal.bullish_votes,
+            "bearish_votes": signal.bearish_votes,
+            "directional_votes": signal.directional_votes,
+            "opposing_votes": signal.opposing_votes,
+            "signal_conflict_ratio": signal.signal_conflict_ratio,
             "reason": signal.reason,
             "last_price": snapshot.last_price,
             "funding_rate": snapshot.funding_rate,
@@ -299,6 +305,12 @@ class ScannerEngine:
                 atr_value=signal.atr_value,
                 wallet_balance=self.wallet.balance,
             )
+            edge_metrics = self._estimate_entry_edge(signal.action, snapshot, plan)
+            diagnostics.update(edge_metrics)
+            if edge_metrics.get("blocked_reason"):
+                diagnostics["eligible"] = False
+                diagnostics["blocks"].append(str(edge_metrics["blocked_reason"]))
+                plan = None
 
         return {
             "symbol": symbol,
@@ -325,6 +337,75 @@ class ScannerEngine:
         for symbol in symbols:
             snapshots[symbol] = await self._get_snapshot(symbol)
         return snapshots
+
+    def _get_latest_bar_ranges(self, symbols: list[str]) -> dict[str, dict[str, float]]:
+        if not getattr(self.cfg, "position_intrabar_from_klines", True):
+            return {}
+        ranges: dict[str, dict[str, float]] = {}
+        for symbol in symbols:
+            try:
+                frame = self.client.get_klines(symbol, self.cfg.timeframe, 2)
+                if frame.empty:
+                    continue
+                row = frame.iloc[-1]
+                ranges[symbol] = {
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                }
+            except Exception as exc:
+                self.logger.warning("Intrabar range unavailable for %s: %s", symbol, exc)
+        return ranges
+
+    def _estimate_entry_edge(self, side: str, snapshot: Any, plan: Any) -> dict[str, Any]:
+        qty = float(getattr(plan, "quantity", 0.0) or 0.0)
+        if qty <= 0:
+            return {
+                "expected_net_tp": 0.0,
+                "expected_net_sl": 0.0,
+                "expected_net_rr": 0.0,
+                "expected_roundtrip_cost": 0.0,
+                "blocked_reason": "cost_edge_limit",
+            }
+
+        bid = float(getattr(snapshot, "bid", 0.0) or 0.0)
+        ask = float(getattr(snapshot, "ask", 0.0) or 0.0)
+        last = float(getattr(snapshot, "last_price", 0.0) or 0.0)
+        entry = ask if side == "long" and ask > 0 else bid if side == "short" and bid > 0 else last
+
+        slippage = float(self.cfg.slippage_rate)
+        fee_rate = float(self.cfg.fee_rate)
+        tp = float(plan.take_profit)
+        sl = float(plan.stop_loss)
+        tp_exit = tp - (tp * slippage) if side == "long" else tp + (tp * slippage)
+        sl_exit = sl - (sl * slippage) if side == "long" else sl + (sl * slippage)
+
+        gross_tp = (tp_exit - entry) * qty if side == "long" else (entry - tp_exit) * qty
+        gross_sl = (sl_exit - entry) * qty if side == "long" else (entry - sl_exit) * qty
+
+        open_fee = abs(entry * qty) * fee_rate
+        close_fee_tp = abs(tp_exit * qty) * fee_rate
+        close_fee_sl = abs(sl_exit * qty) * fee_rate
+        spread_cost = abs(ask - bid) * qty if bid > 0 and ask > 0 else 0.0
+
+        net_tp = gross_tp - open_fee - close_fee_tp - spread_cost
+        net_sl = gross_sl - open_fee - close_fee_sl - spread_cost
+        net_rr = net_tp / abs(net_sl) if net_sl < 0 else (999.0 if net_tp > 0 else 0.0)
+
+        min_rr = float(getattr(self.cfg, "min_expected_net_rr", 0.0))
+        min_profit_pct = float(getattr(self.cfg, "min_expected_net_profit_pct", 0.0))
+        min_profit_abs = max(float(self.wallet.balance) * min_profit_pct, 0.0)
+        blocked_reason = None
+        if net_tp <= 0 or net_rr < min_rr or net_tp < min_profit_abs:
+            blocked_reason = "cost_edge_limit"
+
+        return {
+            "expected_net_tp": round(net_tp, 6),
+            "expected_net_sl": round(net_sl, 6),
+            "expected_net_rr": round(net_rr, 4),
+            "expected_roundtrip_cost": round(open_fee + close_fee_tp + spread_cost, 6),
+            "blocked_reason": blocked_reason,
+        }
 
     def _record_snapshot(self, symbol: str, snapshot) -> None:
         history = self.snapshot_history.setdefault(symbol, deque(maxlen=self.cfg.open_interest_history_size))

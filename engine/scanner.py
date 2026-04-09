@@ -149,12 +149,27 @@ class ScannerEngine:
                 self.daily_counters["blocks"][corr_block] += 1
                 continue
 
+            signal = candidate["signal"]
+            plan = self.risk.build_plan(
+                symbol=symbol,
+                side=signal.action,
+                entry_price=candidate["snapshot"].last_price,
+                atr_value=signal.atr_value,
+                wallet_balance=self.wallet.balance,
+            )
+            edge_metrics = self._estimate_entry_edge(signal.action, candidate["snapshot"], plan)
+            if edge_metrics.get("blocked_reason"):
+                symbol_debug[symbol]["eligible"] = False
+                symbol_debug[symbol]["blocks"].append(str(edge_metrics["blocked_reason"]))
+                self.daily_counters["blocks"][str(edge_metrics["blocked_reason"])] += 1
+                continue
+
             opened = self.executor.open_position(
                 symbol,
-                candidate["signal"].action,
+                signal.action,
                 candidate["snapshot"].last_price,
-                candidate["plan"],
-                candidate["signal"],
+                plan,
+                signal,
             )
             reserved_symbols.add(symbol)
             self.last_trade_time = utc_now()
@@ -167,7 +182,7 @@ class ScannerEngine:
                 f"Giris: {opened['entry_price']:.2f}\n"
                 f"Partial TP: {opened['partial_take_profit_price']:.2f}\n"
                 f"SL: {opened['stop_loss']:.2f} | TP: {opened['take_profit']:.2f}\n"
-                f"Skor: {candidate['signal'].score} | Sebep: {candidate['signal'].reason}"
+                f"Skor: {signal.score} | Sebep: {signal.reason}"
             )
             self.logger.info(msg.replace("\n", " | "))
             await self.notifier(msg)

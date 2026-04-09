@@ -147,6 +147,11 @@ class PaperWallet:
         return None
 
     def open_trade(self, position: Position) -> None:
+        margin_used = float(position.margin_used)
+        if margin_used <= 0:
+            raise RuntimeError("Margin used must be positive")
+        if margin_used > float(self.data["balance"]):
+            raise RuntimeError("Insufficient balance to open position")
         self.data["balance"] -= float(position.margin_used)
         self.data.setdefault("open_positions", []).append(asdict(position))
         self.data["trades_today"] += 1
